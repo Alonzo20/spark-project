@@ -1,5 +1,6 @@
 package com.alonzo.sparkproject.util;
 
+import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
 import java.util.Date;
@@ -15,6 +16,8 @@ public class DateUtils {
 			new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 	public static final SimpleDateFormat DATE_FORMAT = 
 			new SimpleDateFormat("yyyy-MM-dd");
+	public static final SimpleDateFormat DATEKEY_FORMAT = 
+			new SimpleDateFormat("yyyyMMdd");
 	
 	/**
 	 * 判断一个时间是否在另一个时间之前
@@ -79,7 +82,7 @@ public class DateUtils {
 	/**
 	 * 获取年月日和小时
 	 * @param datetime 时间（yyyy-MM-dd HH:mm:ss）
-	 * @return 结果
+	 * @return 结果（yyyy-MM-dd_HH）
 	 */
 	public static String getDateHour(String datetime) {
 		String date = datetime.split(" ")[0];
@@ -128,4 +131,52 @@ public class DateUtils {
 		return TIME_FORMAT.format(date);
 	}
 	
+	/**
+	 * 解析时间字符串
+	 * @param time 时间字符串 
+	 * @return Date
+	 */
+	public static Date parseTime(String time) {
+		try {
+			return TIME_FORMAT.parse(time);
+		} catch (ParseException e) {
+			e.printStackTrace();
+		}
+		return null;
+	}
+	
+	/**
+	 * 格式化日期key
+	 * @param date
+	 * @return
+	 */
+	public static String formatDateKey(Date date) {
+		return DATEKEY_FORMAT.format(date);
+	}
+	
+	/**
+	 * 格式化日期key
+	 * @param date
+	 * @return
+	 */
+	public static Date parseDateKey(String datekey) {
+		try {
+			return DATEKEY_FORMAT.parse(datekey);
+		} catch (ParseException e) {
+			e.printStackTrace();
+		}
+		return null;
+	}
+	
+	/**
+	 * 格式化时间，保留到分钟级别
+	 * yyyyMMddHHmm
+	 * @param date
+	 * @return
+	 */
+	public static String formatTimeMinute(Date date) {
+		SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMddHHmm");  
+		return sdf.format(date);
+	}
+
 }
