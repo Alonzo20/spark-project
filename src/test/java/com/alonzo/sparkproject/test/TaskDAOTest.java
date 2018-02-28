@@ -1,7 +1,7 @@
 package com.alonzo.sparkproject.test;
 
 import com.alonzo.sparkproject.dao.ITaskDAO;
-import com.alonzo.sparkproject.dao.impl.DAOFactory;
+import com.alonzo.sparkproject.dao.factory.DAOFactory;
 import com.alonzo.sparkproject.domain.Task;
 
 /**
