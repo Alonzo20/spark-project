@@ -19,6 +19,8 @@ import scala.math.Ordered;
  */
 public class CategorySortKey implements Ordered<CategorySortKey>,Serializable{
 	
+	private static final long serialVersionUID = 9185040166511376512L;
+	
 	private long clickCount;
 	private long orderCount;
 	private long payCount;
