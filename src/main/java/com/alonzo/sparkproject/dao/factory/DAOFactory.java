@@ -5,11 +5,13 @@ import com.alonzo.sparkproject.dao.ISessionDetailDAO;
 import com.alonzo.sparkproject.dao.ISessionRandomExtractDAO;
 import com.alonzo.sparkproject.dao.ITaskDAO;
 import com.alonzo.sparkproject.dao.ITop10CategoryDAO;
+import com.alonzo.sparkproject.dao.ITop10SessionDAO;
 import com.alonzo.sparkproject.dao.impl.SessionAggrStatDAOImpl;
 import com.alonzo.sparkproject.dao.impl.SessionDetailDAOImpl;
 import com.alonzo.sparkproject.dao.impl.SessionRandomExtractDAOImpl;
 import com.alonzo.sparkproject.dao.impl.TaskDAOImpl;
 import com.alonzo.sparkproject.dao.impl.Top10CategoryDAOImpl;
+import com.alonzo.sparkproject.dao.impl.Top10SessionDAOImpl;
 
 /**
  * DAO工厂类
@@ -36,5 +38,9 @@ public class DAOFactory {
 	
 	public static ITop10CategoryDAO getTop10CategoryDAO() {
 		return new Top10CategoryDAOImpl();
+	}
+	
+	public static ITop10SessionDAO getTop10SessionDAO() {
+		return new Top10SessionDAOImpl();
 	}
 }
