@@ -1,4 +1,4 @@
-package com.alonzo.sparkproject.spark;
+package com.alonzo.sparkproject.spark.session;
 
 import java.util.ArrayList;
 import java.util.Date;
@@ -96,7 +96,7 @@ public class UserVisitSessionAnalyzeSpark {
 		ITaskDAO taskDAO = DAOFactory.getTaskDAO();
 		
 		// 首先得查询出来指定的任务，并获取任务的查询参数
-		long taskid = ParamUtils.getTaskIdFromArgs(args);
+		long taskid = ParamUtils.getTaskIdFromArgs(args, Constants.SPARK_LOCAL_TASKID_SESSION);
 		Task task = taskDAO.findById(taskid);
 		JSONObject taskParam = JSONObject.parseObject(task.getTaskParam());
 		

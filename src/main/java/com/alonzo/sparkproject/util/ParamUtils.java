@@ -2,6 +2,8 @@ package com.alonzo.sparkproject.util;
 
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
+import com.alonzo.sparkproject.conf.ConfigurationManager;
+import com.alonzo.sparkproject.constant.Constants;
 
 /**
  * 参数工具类
@@ -15,14 +17,21 @@ public class ParamUtils {
 	 * @param args 命令行参数
 	 * @return 任务id
 	 */
-	public static Long getTaskIdFromArgs(String[] args) {
-		try {
-			if(args != null && args.length > 0) {
-				return Long.valueOf(args[0]);
+	public static Long getTaskIdFromArgs(String[] args, String taskType) {
+		boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
+		
+		if(local) {
+			return ConfigurationManager.getLong(taskType);  
+		} else {
+			try {
+				if(args != null && args.length > 0) {
+					return Long.valueOf(args[0]);
+				}
+			} catch (Exception e) {
+				e.printStackTrace();
 			}
-		} catch (Exception e) {
-			e.printStackTrace();
-		}  
+		}
+		
 		return null;
 	}
 	
