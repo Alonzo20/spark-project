@@ -93,9 +93,21 @@ public class JDBCHelper {
 		
 		// 然后创建指定数量的数据库连接，并放入数据库连接池中
 		for(int i = 0; i < datasourceSize; i++) {
-			String url = ConfigurationManager.getProperty(Constants.JDBC_URL);
-			String user = ConfigurationManager.getProperty(Constants.JDBC_USER);
-			String password = ConfigurationManager.getProperty(Constants.JDBC_PASSWORD);
+			boolean local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL);
+			String url = null;
+			String user = null;
+			String password = null;
+			
+			if(local) {
+				url = ConfigurationManager.getProperty(Constants.JDBC_URL);
+				user = ConfigurationManager.getProperty(Constants.JDBC_USER);
+				password = ConfigurationManager.getProperty(Constants.JDBC_PASSWORD);
+			} else {
+				url = ConfigurationManager.getProperty(Constants.JDBC_URL_PROD);
+				user = ConfigurationManager.getProperty(Constants.JDBC_USER_PROD);
+				password = ConfigurationManager.getProperty(Constants.JDBC_PASSWORD_PROD);
+			}
+			
 			try {
 				Connection conn = DriverManager.getConnection(url, user, password);
 				datasource.push(conn);  
@@ -142,13 +154,19 @@ public class JDBCHelper {
 		
 		try {
 			conn = getConnection();
+			conn.setAutoCommit(false);  
+			
 			pstmt = conn.prepareStatement(sql);
 			
-			for(int i = 0; i < params.length; i++) {
-				pstmt.setObject(i + 1, params[i]);  
+			if(params != null && params.length > 0) {
+				for(int i = 0; i < params.length; i++) {
+					pstmt.setObject(i + 1, params[i]);  
+				}
 			}
 			
 			rtn = pstmt.executeUpdate();
+			
+			conn.commit();
 		} catch (Exception e) {
 			e.printStackTrace();  
 		} finally {
@@ -176,8 +194,10 @@ public class JDBCHelper {
 			conn = getConnection();
 			pstmt = conn.prepareStatement(sql);
 			
-			for(int i = 0; i < params.length; i++) {
-				pstmt.setObject(i + 1, params[i]);   
+			if(params != null && params.length > 0) {
+				for(int i = 0; i < params.length; i++) {
+					pstmt.setObject(i + 1, params[i]);   
+				}
 			}
 			
 			rs = pstmt.executeQuery();
@@ -221,14 +241,17 @@ public class JDBCHelper {
 			
 			// 第一步：使用Connection对象，取消自动提交
 			conn.setAutoCommit(false);  
+			
 			pstmt = conn.prepareStatement(sql);
 			
 			// 第二步：使用PreparedStatement.addBatch()方法加入批量的SQL参数
-			for(Object[] params : paramsList) {
-				for(int i = 0; i < params.length; i++) {
-					pstmt.setObject(i + 1, params[i]);  
+			if(paramsList != null && paramsList.size() > 0) {
+				for(Object[] params : paramsList) {
+					for(int i = 0; i < params.length; i++) {
+						pstmt.setObject(i + 1, params[i]);  
+					}
+					pstmt.addBatch();
 				}
-				pstmt.addBatch();
 			}
 			
 			// 第三步：使用PreparedStatement.executeBatch()方法，执行批量的SQL语句
@@ -238,6 +261,10 @@ public class JDBCHelper {
 			conn.commit();
 		} catch (Exception e) {
 			e.printStackTrace();  
+		} finally {
+			if(conn != null) {
+				datasource.push(conn);  
+			}
 		}
 		
 		return rtn;

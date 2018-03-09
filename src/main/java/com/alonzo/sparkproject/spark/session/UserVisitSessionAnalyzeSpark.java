@@ -1,5 +1,8 @@
 package com.alonzo.sparkproject.spark.session;
 
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntList;
+
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
@@ -19,10 +22,12 @@ import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.api.java.function.VoidFunction;
+import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SQLContext;
 import org.apache.spark.sql.hive.HiveContext;
+import org.apache.spark.storage.StorageLevel;
 
 import scala.Tuple2;
 
@@ -46,6 +51,7 @@ import com.alonzo.sparkproject.domain.Top10Session;
 import com.alonzo.sparkproject.util.DateUtils;
 import com.alonzo.sparkproject.util.NumberUtils;
 import com.alonzo.sparkproject.util.ParamUtils;
+import com.alonzo.sparkproject.util.SparkUtils;
 import com.alonzo.sparkproject.util.StringUtils;
 import com.alonzo.sparkproject.util.ValidUtils;
 import com.google.common.base.Optional;
@@ -77,20 +83,40 @@ import com.google.common.base.Optional;
  * @author Administrator
  *
  */
+@SuppressWarnings("unused")
 public class UserVisitSessionAnalyzeSpark {
 	
 	public static void main(String[] args) {
-		args = new String[]{"2"};  
-		
 		// 构建Spark上下文
 		SparkConf conf = new SparkConf()
 				.setAppName(Constants.SPARK_APP_NAME_SESSION)
-				.setMaster("local");    
+//				.set("spark.default.parallelism", "100")
+				.set("spark.storage.memoryFraction", "0.5")  
+				.set("spark.shuffle.consolidateFiles", "true")
+				.set("spark.shuffle.file.buffer", "64")  
+				.set("spark.shuffle.memoryFraction", "0.3")    
+				.set("spark.reducer.maxSizeInFlight", "24")  
+				.set("spark.shuffle.io.maxRetries", "60")  
+				.set("spark.shuffle.io.retryWait", "60")   
+				.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+				.registerKryoClasses(new Class[]{
+						CategorySortKey.class,
+						IntList.class});   
+		SparkUtils.setMaster(conf); 
+		
+		/**
+		 * 比如，获取top10热门品类功能中，二次排序，自定义了一个Key
+		 * 那个key是需要在进行shuffle的时候，进行网络传输的，因此也是要求实现序列化的
+		 * 启用Kryo机制以后，就会用Kryo去序列化和反序列化CategorySortKey
+		 * 所以这里要求，为了获取最佳性能，注册一下我们自定义的类
+		 */
+		
 		JavaSparkContext sc = new JavaSparkContext(conf);
+//		sc.checkpointFile("hdfs://");
 		SQLContext sqlContext = getSQLContext(sc.sc());
 		
 		// 生成模拟测试数据
-		mockData(sc, sqlContext);
+		SparkUtils.mockData(sc, sqlContext);  
 		
 		// 创建需要使用的DAO组件
 		ITaskDAO taskDAO = DAOFactory.getTaskDAO();
@@ -98,12 +124,47 @@ public class UserVisitSessionAnalyzeSpark {
 		// 首先得查询出来指定的任务，并获取任务的查询参数
 		long taskid = ParamUtils.getTaskIdFromArgs(args, Constants.SPARK_LOCAL_TASKID_SESSION);
 		Task task = taskDAO.findById(taskid);
+		if(task == null) {
+			System.out.println(new Date() + ": cannot find this task with id [" + taskid + "].");  
+			return;
+		}
+		
 		JSONObject taskParam = JSONObject.parseObject(task.getTaskParam());
 		
 		// 如果要进行session粒度的数据聚合
 		// 首先要从user_visit_action表中，查询出来指定日期范围内的行为数据
-		JavaRDD<Row> actionRDD = getActionRDDByDateRange(sqlContext, taskParam);
+		
+		/**
+		 * actionRDD，就是一个公共RDD
+		 * 第一，要用ationRDD，获取到一个公共的sessionid为key的PairRDD
+		 * 第二，actionRDD，用在了session聚合环节里面
+		 * 
+		 * sessionid为key的PairRDD，是确定了，在后面要多次使用的
+		 * 1、与通过筛选的sessionid进行join，获取通过筛选的session的明细数据
+		 * 2、将这个RDD，直接传入aggregateBySession方法，进行session聚合统计
+		 * 
+		 * 重构完以后，actionRDD，就只在最开始，使用一次，用来生成以sessionid为key的RDD
+		 * 
+		 */
+		JavaRDD<Row> actionRDD = SparkUtils.getActionRDDByDateRange(sqlContext, taskParam);
 		JavaPairRDD<String, Row> sessionid2actionRDD = getSessionid2ActionRDD(actionRDD);
+		
+		/**
+		 * 持久化，很简单，就是对RDD调用persist()方法，并传入一个持久化级别
+		 * 
+		 * 如果是persist(StorageLevel.MEMORY_ONLY())，纯内存，无序列化，那么就可以用cache()方法来替代
+		 * StorageLevel.MEMORY_ONLY_SER()，第二选择
+		 * StorageLevel.MEMORY_AND_DISK()，第三选择
+		 * StorageLevel.MEMORY_AND_DISK_SER()，第四选择
+		 * StorageLevel.DISK_ONLY()，第五选择
+		 * 
+		 * 如果内存充足，要使用双副本高可靠机制
+		 * 选择后缀带_2的策略
+		 * StorageLevel.MEMORY_ONLY_2()
+		 * 
+		 */
+		sessionid2actionRDD = sessionid2actionRDD.persist(StorageLevel.MEMORY_ONLY());
+//		sessionid2actionRDD.checkpoint();
 		
 		// 首先，可以将行为数据，按照session_id进行groupByKey分组
 		// 此时的数据的粒度就是session粒度了，然后呢，可以将session粒度的数据
@@ -111,7 +172,7 @@ public class UserVisitSessionAnalyzeSpark {
 		// 然后就可以获取到session粒度的数据，同时呢，数据里面还包含了session对应的user的信息
 		// 到这里为止，获取的数据是<sessionid,(sessionid,searchKeywords,clickCategoryIds,age,professional,city,sex)>  
 		JavaPairRDD<String, String> sessionid2AggrInfoRDD = 
-				aggregateBySession(sqlContext, actionRDD);
+				aggregateBySession(sc, sqlContext, sessionid2actionRDD);
 		
 		// 接着，就要针对session粒度的聚合数据，按照使用者指定的筛选参数进行数据过滤
 		// 相当于我们自己编写的算子，是要访问外面的任务参数对象的
@@ -123,11 +184,17 @@ public class UserVisitSessionAnalyzeSpark {
 		
 		JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD = filterSessionAndAggrStat(
 				sessionid2AggrInfoRDD, taskParam, sessionAggrStatAccumulator);
+		filteredSessionid2AggrInfoRDD = filteredSessionid2AggrInfoRDD.persist(StorageLevel.MEMORY_ONLY());
 		
 		// 生成公共的RDD：通过筛选条件的session的访问明细数据
+		
+		/**
+		 * 重构：sessionid2detailRDD，就是代表了通过筛选的session对应的访问明细数据
+		 */
 		JavaPairRDD<String, Row> sessionid2detailRDD = getSessionid2detailRDD(
 				filteredSessionid2AggrInfoRDD, sessionid2actionRDD);
-				
+		sessionid2detailRDD = sessionid2detailRDD.persist(StorageLevel.MEMORY_ONLY());
+		
 		/**
 		 * 对于Accumulator这种分布式累加计算的变量的使用，有一个重要说明
 		 * 
@@ -144,8 +211,8 @@ public class UserVisitSessionAnalyzeSpark {
 		 * 计算出来的结果，在J2EE中，是怎么显示的，是用两张柱状图显示
 		 */
 		
-		randomExtractSession(task.getTaskid(), 
-				filteredSessionid2AggrInfoRDD, sessionid2actionRDD);  
+		randomExtractSession(sc, task.getTaskid(), 
+				filteredSessionid2AggrInfoRDD, sessionid2detailRDD);
 		
 		/**
 		 * 特别说明
@@ -267,8 +334,19 @@ public class UserVisitSessionAnalyzeSpark {
 				+ "from user_visit_action "
 				+ "where date>='" + startDate + "' "
 				+ "and date<='" + endDate + "'";  
+//				+ "and session_id not in('','','')"
 		
 		DataFrame actionDF = sqlContext.sql(sql);
+		
+		/**
+		 * 这里就很有可能发生上面说的问题
+		 * 比如说，Spark SQl默认就给第一个stage设置了20个task，但是根据你的数据量以及算法的复杂度
+		 * 实际上，你需要1000个task去并行执行
+		 * 
+		 * 所以说，在这里，就可以对Spark SQL刚刚查询出来的RDD执行repartition重分区操作
+		 */
+		
+//		return actionDF.javaRDD().repartition(1000);
 		
 		return actionDF.javaRDD();
 	}
@@ -279,13 +357,32 @@ public class UserVisitSessionAnalyzeSpark {
 	 * @return
 	 */
 	public static JavaPairRDD<String, Row> getSessionid2ActionRDD(JavaRDD<Row> actionRDD) {
-		return actionRDD.mapToPair(new PairFunction<Row, String, Row>() {
- 
+//		return actionRDD.mapToPair(new PairFunction<Row, String, Row>() {
+//
+//			private static final long serialVersionUID = 1L;
+//			
+//			@Override
+//			public Tuple2<String, Row> call(Row row) throws Exception {
+//				return new Tuple2<String, Row>(row.getString(2), row);  
+//			}
+//			
+//		});
+		
+		return actionRDD.mapPartitionsToPair(new PairFlatMapFunction<Iterator<Row>, String, Row>() {
+
 			private static final long serialVersionUID = 1L;
 
 			@Override
-			public Tuple2<String, Row> call(Row row) throws Exception {
-				return new Tuple2<String, Row>(row.getString(2), row);
+			public Iterable<Tuple2<String, Row>> call(Iterator<Row> iterator)
+					throws Exception {
+				List<Tuple2<String, Row>> list = new ArrayList<Tuple2<String, Row>>();
+				
+				while(iterator.hasNext()) {
+					Row row = iterator.next();
+					list.add(new Tuple2<String, Row>(row.getString(2), row));  
+				}
+				
+				return list;
 			}
 			
 		});
@@ -297,30 +394,12 @@ public class UserVisitSessionAnalyzeSpark {
 	 * @return session粒度聚合数据
 	 */
 	private static JavaPairRDD<String, String> aggregateBySession(
-			SQLContext sqlContext, JavaRDD<Row> actionRDD) {
-		// 现在actionRDD中的元素是Row，一个Row就是一行用户访问行为记录，比如一次点击或者搜索
-		// 我们现在需要将这个Row映射成<sessionid,Row>的格式
-		JavaPairRDD<String, Row> sessionid2ActionRDD = actionRDD.mapToPair(
-				
-				/**
-				 * PairFunction
-				 * 第一个参数，相当于是函数的输入
-				 * 第二个参数和第三个参数，相当于是函数的输出（Tuple），分别是Tuple第一个和第二个值
-				 */
-				new PairFunction<Row, String, Row>() {
-
-					private static final long serialVersionUID = 1L;
-
-					@Override
-					public Tuple2<String, Row> call(Row row) throws Exception {
-						return new Tuple2<String, Row>(row.getString(2), row);
-					}
-					
-				});
-		
+			JavaSparkContext sc,
+			SQLContext sqlContext, 
+			JavaPairRDD<String, Row> sessinoid2actionRDD) {
 		// 对行为数据按session粒度进行分组
 		JavaPairRDD<String, Iterable<Row>> sessionid2ActionsRDD = 
-				sessionid2ActionRDD.groupByKey();
+				sessinoid2actionRDD.groupByKey();
 		
 		// 对每一个session分组进行聚合，将session中所有的搜索词和点击品类都聚合起来
 		// 到此为止，获取的数据格式，如下：<userid,partAggrInfo(sessionid,searchKeywords,clickCategoryIds)>
@@ -425,7 +504,7 @@ public class UserVisitSessionAnalyzeSpark {
 								+ Constants.FIELD_SEARCH_KEYWORDS + "=" + searchKeywords + "|"
 								+ Constants.FIELD_CLICK_CATEGORY_IDS + "=" + clickCategoryIds + "|"
 								+ Constants.FIELD_VISIT_LENGTH + "=" + visitLength + "|"
-								+ Constants.FIELD_STEP_LENGTH + "=" + stepLength + "|"  
+								+ Constants.FIELD_STEP_LENGTH + "=" + stepLength + "|"
 								+ Constants.FIELD_START_TIME + "=" + DateUtils.formatTime(startTime);    
 						
 						return new Tuple2<Long, String>(userid, partAggrInfo);
@@ -449,6 +528,14 @@ public class UserVisitSessionAnalyzeSpark {
 					}
 					
 				});
+		
+		/**
+		 * 这里就可以说一下，比较适合采用reduce join转换为map join的方式
+		 * 
+		 * userid2PartAggrInfoRDD，可能数据量还是比较大，比如，可能在1千万数据
+		 * userid2InfoRDD，可能数据量还是比较小的，你的用户数量才10万用户
+		 * 
+		 */
 		
 		// 将session粒度聚合数据，与用户信息进行join
 		JavaPairRDD<Long, Tuple2<String, Row>> userid2FullInfoRDD = 
@@ -486,6 +573,299 @@ public class UserVisitSessionAnalyzeSpark {
 					}
 					
 				});
+		
+		/**
+		 * reduce join转换为map join
+		 */
+		
+//		List<Tuple2<Long, Row>> userInfos = userid2InfoRDD.collect();
+//		final Broadcast<List<Tuple2<Long, Row>>> userInfosBroadcast = sc.broadcast(userInfos);
+//		
+//		JavaPairRDD<String, String> sessionid2FullAggrInfoRDD = userid2PartAggrInfoRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<Long,String>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(Tuple2<Long, String> tuple)
+//							throws Exception {
+//						// 得到用户信息map
+//						List<Tuple2<Long, Row>> userInfos = userInfosBroadcast.value();
+//						
+//						Map<Long, Row> userInfoMap = new HashMap<Long, Row>();
+//						for(Tuple2<Long, Row> userInfo : userInfos) {
+//							userInfoMap.put(userInfo._1, userInfo._2);
+//						}
+//						
+//						// 获取到当前用户对应的信息
+//						String partAggrInfo = tuple._2;
+//						Row userInfoRow = userInfoMap.get(tuple._1);
+//						
+//						String sessionid = StringUtils.getFieldFromConcatString(
+//								partAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
+//						
+//						int age = userInfoRow.getInt(3);
+//						String professional = userInfoRow.getString(4);
+//						String city = userInfoRow.getString(5);
+//						String sex = userInfoRow.getString(6);
+//						
+//						String fullAggrInfo = partAggrInfo + "|"
+//								+ Constants.FIELD_AGE + "=" + age + "|"
+//								+ Constants.FIELD_PROFESSIONAL + "=" + professional + "|"
+//								+ Constants.FIELD_CITY + "=" + city + "|"
+//								+ Constants.FIELD_SEX + "=" + sex;
+//						
+//						return new Tuple2<String, String>(sessionid, fullAggrInfo);
+//					}
+//					
+//				});
+		
+		/**
+		 * sample采样倾斜key单独进行join
+		 */
+		
+//		JavaPairRDD<Long, String> sampledRDD = userid2PartAggrInfoRDD.sample(false, 0.1, 9);
+//		
+//		JavaPairRDD<Long, Long> mappedSampledRDD = sampledRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<Long,String>, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<Long, Long> call(Tuple2<Long, String> tuple)
+//							throws Exception {
+//						return new Tuple2<Long, Long>(tuple._1, 1L);
+//					}
+//					
+//				});
+//		
+//		JavaPairRDD<Long, Long> computedSampledRDD = mappedSampledRDD.reduceByKey(
+//				
+//				new Function2<Long, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//		
+//					@Override
+//					public Long call(Long v1, Long v2) throws Exception {
+//						return v1 + v2;
+//					}
+//					
+//				});
+//		
+//		JavaPairRDD<Long, Long> reversedSampledRDD = computedSampledRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<Long,Long>, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<Long, Long> call(Tuple2<Long, Long> tuple)
+//							throws Exception {
+//						return new Tuple2<Long, Long>(tuple._2, tuple._1);
+//					}
+//					
+//				});
+//		
+//		final Long skewedUserid = reversedSampledRDD.sortByKey(false).take(1).get(0)._2;  
+//		
+//		JavaPairRDD<Long, String> skewedRDD = userid2PartAggrInfoRDD.filter(
+//				
+//				new Function<Tuple2<Long,String>, Boolean>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Boolean call(Tuple2<Long, String> tuple) throws Exception {
+//						return tuple._1.equals(skewedUserid);
+//					}
+//					
+//				});
+//			
+//		JavaPairRDD<Long, String> commonRDD = userid2PartAggrInfoRDD.filter(
+//				
+//				new Function<Tuple2<Long,String>, Boolean>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Boolean call(Tuple2<Long, String> tuple) throws Exception {
+//						return !tuple._1.equals(skewedUserid);
+//					}
+//					
+//				});
+//		
+//		JavaPairRDD<String, Row> skewedUserid2infoRDD = userid2InfoRDD.filter(
+//				
+//				new Function<Tuple2<Long,Row>, Boolean>() {
+//
+//					private static final long serialVersionUID = 1L;
+//		
+//					@Override
+//					public Boolean call(Tuple2<Long, Row> tuple) throws Exception {
+//						return tuple._1.equals(skewedUserid);
+//					}
+//					
+//				}).flatMapToPair(new PairFlatMapFunction<Tuple2<Long,Row>, String, Row>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Iterable<Tuple2<String, Row>> call(
+//							Tuple2<Long, Row> tuple) throws Exception {
+//						Random random = new Random();
+//						List<Tuple2<String, Row>> list = new ArrayList<Tuple2<String, Row>>();
+//						
+//						for(int i = 0; i < 100; i++) {
+//							int prefix = random.nextInt(100);
+//							list.add(new Tuple2<String, Row>(prefix + "_" + tuple._1, tuple._2));
+//						}
+//						
+//						return list;
+//					}
+//					
+//				});
+//		
+//		JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD1 = skewedRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<Long,String>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(Tuple2<Long, String> tuple)
+//							throws Exception {
+//						Random random = new Random();
+//						int prefix = random.nextInt(100);
+//						return new Tuple2<String, String>(prefix + "_" + tuple._1, tuple._2);
+//					}
+//					
+//				}).join(skewedUserid2infoRDD).mapToPair(
+//						
+//						new PairFunction<Tuple2<String,Tuple2<String,Row>>, Long, Tuple2<String, Row>>() {
+//
+//							private static final long serialVersionUID = 1L;
+//		
+//							@Override
+//							public Tuple2<Long, Tuple2<String, Row>> call(
+//									Tuple2<String, Tuple2<String, Row>> tuple)
+//									throws Exception {
+//								long userid = Long.valueOf(tuple._1.split("_")[1]);  
+//								return new Tuple2<Long, Tuple2<String, Row>>(userid, tuple._2);  
+//							}
+//							
+//						});
+//		
+//		JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD2 = commonRDD.join(userid2InfoRDD);
+//		
+//		JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD = joinedRDD1.union(joinedRDD2);
+//		
+//		JavaPairRDD<String, String> sessionid2FullAggrInfoRDD = joinedRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<Long,Tuple2<String,Row>>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(
+//							Tuple2<Long, Tuple2<String, Row>> tuple)
+//							throws Exception {
+//						String partAggrInfo = tuple._2._1;
+//						Row userInfoRow = tuple._2._2;
+//						
+//						String sessionid = StringUtils.getFieldFromConcatString(
+//								partAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
+//						
+//						int age = userInfoRow.getInt(3);
+//						String professional = userInfoRow.getString(4);
+//						String city = userInfoRow.getString(5);
+//						String sex = userInfoRow.getString(6);
+//						
+//						String fullAggrInfo = partAggrInfo + "|"
+//								+ Constants.FIELD_AGE + "=" + age + "|"
+//								+ Constants.FIELD_PROFESSIONAL + "=" + professional + "|"
+//								+ Constants.FIELD_CITY + "=" + city + "|"
+//								+ Constants.FIELD_SEX + "=" + sex;
+//						
+//						return new Tuple2<String, String>(sessionid, fullAggrInfo);
+//					}
+//					
+//				});
+		
+		/**
+		 * 使用随机数和扩容表进行join
+		 */
+		
+//		JavaPairRDD<String, Row> expandedRDD = userid2InfoRDD.flatMapToPair(
+//				
+//				new PairFlatMapFunction<Tuple2<Long,Row>, String, Row>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Iterable<Tuple2<String, Row>> call(Tuple2<Long, Row> tuple)
+//							throws Exception {
+//						List<Tuple2<String, Row>> list = new ArrayList<Tuple2<String, Row>>();
+//						
+//						for(int i = 0; i < 10; i++) {
+//							list.add(new Tuple2<String, Row>(0 + "_" + tuple._1, tuple._2));
+//						}
+//						
+//						return list;
+//					}
+//					
+//				});
+//		
+//		JavaPairRDD<String, String> mappedRDD = userid2PartAggrInfoRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<Long,String>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(Tuple2<Long, String> tuple)
+//							throws Exception {
+//						Random random = new Random();
+//						int prefix = random.nextInt(10);
+//						return new Tuple2<String, String>(prefix + "_" + tuple._1, tuple._2);  
+//					}
+//					
+//				});
+//		
+//		JavaPairRDD<String, Tuple2<String, Row>> joinedRDD = mappedRDD.join(expandedRDD);
+//		
+//		JavaPairRDD<String, String> finalRDD = joinedRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<String,Tuple2<String,Row>>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(
+//							Tuple2<String, Tuple2<String, Row>> tuple)
+//							throws Exception {
+//						String partAggrInfo = tuple._2._1;
+//						Row userInfoRow = tuple._2._2;
+//						
+//						String sessionid = StringUtils.getFieldFromConcatString(
+//								partAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
+//						
+//						int age = userInfoRow.getInt(3);
+//						String professional = userInfoRow.getString(4);
+//						String city = userInfoRow.getString(5);
+//						String sex = userInfoRow.getString(6);
+//						
+//						String fullAggrInfo = partAggrInfo + "|"
+//								+ Constants.FIELD_AGE + "=" + age + "|"
+//								+ Constants.FIELD_PROFESSIONAL + "=" + professional + "|"
+//								+ Constants.FIELD_CITY + "=" + city + "|"
+//								+ Constants.FIELD_SEX + "=" + sex;
+//						
+//						return new Tuple2<String, String>(sessionid, fullAggrInfo);
+//					}
+//					
+//				});
 		
 		return sessionid2FullAggrInfoRDD;
 	}
@@ -683,30 +1063,31 @@ public class UserVisitSessionAnalyzeSpark {
 	 * @param sessionid2AggrInfoRDD  
 	 */
 	private static void randomExtractSession(
+			JavaSparkContext sc,
 			final long taskid,
 			JavaPairRDD<String, String> sessionid2AggrInfoRDD,
-			JavaPairRDD<String, Row> sessionid2actionRDD) {
+			JavaPairRDD<String, Row> sessionid2actionRDD) { 
 		/**
 		 * 第一步，计算出每天每小时的session数量
 		 */
-
+		
 		// 获取<yyyy-MM-dd_HH,aggrInfo>格式的RDD
 		JavaPairRDD<String, String> time2sessionidRDD = sessionid2AggrInfoRDD.mapToPair(
 				
 				new PairFunction<Tuple2<String,String>, String, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
 					public Tuple2<String, String> call(
-							Tuple2<String, String> tuple)throws Exception {
+							Tuple2<String, String> tuple) throws Exception {
 						String aggrInfo = tuple._2;
 						
 						String startTime = StringUtils.getFieldFromConcatString(
 								aggrInfo, "\\|", Constants.FIELD_START_TIME);
 						String dateHour = DateUtils.getDateHour(startTime);
 						
-						return new Tuple2<String, String>(dateHour, aggrInfo);
+						return new Tuple2<String, String>(dateHour, aggrInfo);  
 					}
 					
 				});
@@ -721,6 +1102,17 @@ public class UserVisitSessionAnalyzeSpark {
 		 */
 		
 		// 得到每天每小时的session数量
+		
+		/**
+		 * 每天每小时的session数量的计算
+		 * 是有可能出现数据倾斜的吧，这个是没有疑问的
+		 * 比如说大部分小时，一般访问量也就10万；但是，中午12点的时候，高峰期，一个小时1000万
+		 * 这个时候，就会发生数据倾斜
+		 * 
+		 * 我们就用这个countByKey操作，给大家演示第三种和第四种方案
+		 * 
+		 */
+		
 		Map<String, Object> countMap = time2sessionidRDD.countByKey();
 		
 		/**
@@ -731,15 +1123,15 @@ public class UserVisitSessionAnalyzeSpark {
 		Map<String, Map<String, Long>> dateHourCountMap = 
 				new HashMap<String, Map<String, Long>>();
 		
-		for(Map.Entry<String, Object> countEntry : countMap.entrySet()){
+		for(Map.Entry<String, Object> countEntry : countMap.entrySet()) {
 			String dateHour = countEntry.getKey();
 			String date = dateHour.split("_")[0];
-			String hour = dateHour.split("_")[1];
+			String hour = dateHour.split("_")[1];  
 			
-			long count = Long.valueOf(String.valueOf(countEntry.getValue()));
+			long count = Long.valueOf(String.valueOf(countEntry.getValue()));  
 			
-			Map<String,Long> hourCountMap = dateHourCountMap.get(date);
-			if(hourCountMap == null){
+			Map<String, Long> hourCountMap = dateHourCountMap.get(date);
+			if(hourCountMap == null) {
 				hourCountMap = new HashMap<String, Long>();
 				dateHourCountMap.put(date, hourCountMap);
 			}
@@ -753,57 +1145,108 @@ public class UserVisitSessionAnalyzeSpark {
 		int extractNumberPerDay = 100 / dateHourCountMap.size();
 		
 		// <date,<hour,(3,5,20,102)>>  
-		final Map<String, Map<String,List<Integer>>> dateHourExtractMap = 
-					new HashMap<String, Map<String,List<Integer>>>();
+		
+		/**
+		 * session随机抽取功能
+		 * 
+		 * 用到了一个比较大的变量，随机抽取索引map
+		 * 之前是直接在算子里面使用了这个map，那么根据我们刚才讲的这个原理，每个task都会拷贝一份map副本
+		 * 还是比较消耗内存和网络传输性能的
+		 * 
+		 * 将map做成广播变量
+		 * 
+		 */
+		Map<String, Map<String, List<Integer>>> dateHourExtractMap = 
+				new HashMap<String, Map<String, List<Integer>>>();
 		
 		Random random = new Random();
 		
-		for(Map.Entry<String, Map<String,Long>> dateHourCountEntry :dateHourCountMap.entrySet()){
+		for(Map.Entry<String, Map<String, Long>> dateHourCountEntry : dateHourCountMap.entrySet()) {
 			String date = dateHourCountEntry.getKey();
 			Map<String, Long> hourCountMap = dateHourCountEntry.getValue();
 			
 			// 计算出这一天的session总数
 			long sessionCount = 0L;
-			for(long hourCount : hourCountMap.values()){
+			for(long hourCount : hourCountMap.values()) {
 				sessionCount += hourCount;
 			}
 			
 			Map<String, List<Integer>> hourExtractMap = dateHourExtractMap.get(date);
-			if(hourExtractMap == null){
+			if(hourExtractMap == null) {
 				hourExtractMap = new HashMap<String, List<Integer>>();
 				dateHourExtractMap.put(date, hourExtractMap);
 			}
 			
-			//遍历每个小时
-			for(Map.Entry<String, Long> hourCountEntry : hourCountMap.entrySet()){
+			// 遍历每个小时
+			for(Map.Entry<String, Long> hourCountEntry : hourCountMap.entrySet()) {
 				String hour = hourCountEntry.getKey();
 				long count = hourCountEntry.getValue();
 				
 				// 计算每个小时的session数量，占据当天总session数量的比例，直接乘以每天要抽取的数量
 				// 就可以计算出，当前小时需要抽取的session数量
-				int hourExtractNumber = (int)(((double)count / (double)sessionCount)
-						*extractNumberPerDay);
-				if(hourExtractNumber > count){
+				int hourExtractNumber = (int)(((double)count / (double)sessionCount) 
+						* extractNumberPerDay);
+				if(hourExtractNumber > count) {
 					hourExtractNumber = (int) count;
 				}
 				
 				// 先获取当前小时的存放随机数的list
 				List<Integer> extractIndexList = hourExtractMap.get(hour);
-				if(extractIndexList == null){
+				if(extractIndexList == null) {
 					extractIndexList = new ArrayList<Integer>();
 					hourExtractMap.put(hour, extractIndexList);
 				}
 				
 				// 生成上面计算出来的数量的随机数
-				for(int i = 0; i < hourExtractNumber; i++){
+				for(int i = 0; i < hourExtractNumber; i++) {
 					int extractIndex = random.nextInt((int) count);
-					while(extractIndexList.contains(extractIndex)){
+					while(extractIndexList.contains(extractIndex)) {
 						extractIndex = random.nextInt((int) count);
 					}
 					extractIndexList.add(extractIndex);
 				}
 			}
 		}
+		
+		/**
+		 * fastutil的使用，很简单，比如List<Integer>的list，对应到fastutil，就是IntList
+		 */
+		Map<String, Map<String, IntList>> fastutilDateHourExtractMap = 
+				new HashMap<String, Map<String, IntList>>();
+		
+		
+		
+		for(Map.Entry<String, Map<String, List<Integer>>> dateHourExtractEntry : 
+				dateHourExtractMap.entrySet()) {
+			String date = dateHourExtractEntry.getKey();
+			Map<String, List<Integer>> hourExtractMap = dateHourExtractEntry.getValue();
+			
+			Map<String, IntList> fastutilHourExtractMap = new HashMap<String, IntList>();
+			
+			for(Map.Entry<String, List<Integer>> hourExtractEntry : hourExtractMap.entrySet()) {
+				String hour = hourExtractEntry.getKey();
+				List<Integer> extractList = hourExtractEntry.getValue();
+				
+				IntList fastutilExtractList = new IntArrayList();
+				
+				for(int i = 0; i < extractList.size(); i++) {
+					fastutilExtractList.add(extractList.get(i));  
+				}
+				
+				fastutilHourExtractMap.put(hour, fastutilExtractList);
+			}
+			
+			fastutilDateHourExtractMap.put(date, fastutilHourExtractMap);
+		}
+		
+		/**
+		 * 广播变量，很简单
+		 * 其实就是SparkContext的broadcast()方法，传入你要广播的变量，即可
+		 */		
+		
+		
+		final Broadcast<Map<String, Map<String, IntList>>> dateHourExtractMapBroadcast = 
+				sc.broadcast(fastutilDateHourExtractMap);
 		
 		/**
 		 * 第三步：遍历每天每小时的session，然后根据随机索引进行抽取
@@ -821,49 +1264,56 @@ public class UserVisitSessionAnalyzeSpark {
 		JavaPairRDD<String, String> extractSessionidsRDD = time2sessionsRDD.flatMapToPair(
 				
 				new PairFlatMapFunction<Tuple2<String,Iterable<String>>, String, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
 					public Iterable<Tuple2<String, String>> call(
-							Tuple2<String, Iterable<String>> tuple) 
+							Tuple2<String, Iterable<String>> tuple)
 							throws Exception {
-						List<Tuple2<String, String>> extractSessionids =
-								new ArrayList<Tuple2<String,String>>();
+						List<Tuple2<String, String>> extractSessionids = 
+								new ArrayList<Tuple2<String, String>>();
 						
 						String dateHour = tuple._1;
 						String date = dateHour.split("_")[0];
 						String hour = dateHour.split("_")[1];
 						Iterator<String> iterator = tuple._2.iterator();
 						
-						List<Integer> extractIndexList = dateHourExtractMap.get(date).get(hour);
+						/**
+						 * 使用广播变量的时候
+						 * 直接调用广播变量（Broadcast类型）的value() / getValue() 
+						 * 可以获取到之前封装的广播变量
+						 */
+						Map<String, Map<String, IntList>> dateHourExtractMap = 
+								dateHourExtractMapBroadcast.value();
+						List<Integer> extractIndexList = dateHourExtractMap.get(date).get(hour);  
 						
 						ISessionRandomExtractDAO sessionRandomExtractDAO = 
 								DAOFactory.getSessionRandomExtractDAO();
 						
 						int index = 0;
-						while(iterator.hasNext()){
+						while(iterator.hasNext()) {
 							String sessionAggrInfo = iterator.next();
 							
-							if(extractIndexList.contains(index)){
+							if(extractIndexList.contains(index)) {
 								String sessionid = StringUtils.getFieldFromConcatString(
 										sessionAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
 								
 								// 将数据写入MySQL
 								SessionRandomExtract sessionRandomExtract = new SessionRandomExtract();
-								sessionRandomExtract.setTaskid(taskid);
-								sessionRandomExtract.setSessionid(sessionid);
+								sessionRandomExtract.setTaskid(taskid);  
+								sessionRandomExtract.setSessionid(sessionid);  
 								sessionRandomExtract.setStartTime(StringUtils.getFieldFromConcatString(
-										sessionAggrInfo, "\\|", Constants.FIELD_START_TIME));
+										sessionAggrInfo, "\\|", Constants.FIELD_START_TIME));  
 								sessionRandomExtract.setSearchKeywords(StringUtils.getFieldFromConcatString(
 										sessionAggrInfo, "\\|", Constants.FIELD_SEARCH_KEYWORDS));
 								sessionRandomExtract.setClickCategoryIds(StringUtils.getFieldFromConcatString(
 										sessionAggrInfo, "\\|", Constants.FIELD_CLICK_CATEGORY_IDS));
 								
-								sessionRandomExtractDAO.insert(sessionRandomExtract);
+								sessionRandomExtractDAO.insert(sessionRandomExtract);  
 								
 								// 将sessionid加入list
-								extractSessionids.add(new Tuple2<String, String>(sessionid, sessionid));
+								extractSessionids.add(new Tuple2<String, String>(sessionid, sessionid));  
 							}
 							
 							index++;
@@ -877,34 +1327,75 @@ public class UserVisitSessionAnalyzeSpark {
 		/**
 		 * 第四步：获取抽取出来的session的明细数据
 		 */
-		JavaPairRDD<String, Tuple2<String, Row>> extractSessionDetailRDD = 
+		JavaPairRDD<String, Tuple2<String, Row>> extractSessionDetailRDD =
 				extractSessionidsRDD.join(sessionid2actionRDD);
-		extractSessionDetailRDD.foreach(new VoidFunction<Tuple2<String,Tuple2<String,Row>>>() {
-		 
-			private static final long serialVersionUID = 1L;
+		
+//		extractSessionDetailRDD.foreach(new VoidFunction<Tuple2<String,Tuple2<String,Row>>>() {  
+//			
+//			private static final long serialVersionUID = 1L;
+//			
+//			@Override
+//			public void call(Tuple2<String, Tuple2<String, Row>> tuple) throws Exception {
+//				Row row = tuple._2._2;
+//				
+//				SessionDetail sessionDetail = new SessionDetail();
+//				sessionDetail.setTaskid(taskid);  
+//				sessionDetail.setUserid(row.getLong(1));  
+//				sessionDetail.setSessionid(row.getString(2));  
+//				sessionDetail.setPageid(row.getLong(3));  
+//				sessionDetail.setActionTime(row.getString(4));
+//				sessionDetail.setSearchKeyword(row.getString(5));  
+//				sessionDetail.setClickCategoryId(row.getLong(6));  
+//				sessionDetail.setClickProductId(row.getLong(7));   
+//				sessionDetail.setOrderCategoryIds(row.getString(8));  
+//				sessionDetail.setOrderProductIds(row.getString(9));  
+//				sessionDetail.setPayCategoryIds(row.getString(10)); 
+//				sessionDetail.setPayProductIds(row.getString(11));  
+//				
+//				ISessionDetailDAO sessionDetailDAO = DAOFactory.getSessionDetailDAO();
+//				sessionDetailDAO.insert(sessionDetail);  
+//			}
+//		});
+		
+		extractSessionDetailRDD.foreachPartition(
+				
+				new VoidFunction<Iterator<Tuple2<String,Tuple2<String,Row>>>>() {
 
-			@Override
-			public void call(Tuple2<String, Tuple2<String, Row>> tuple) throws Exception {
-				Row row = tuple._2._2;
-				
-				SessionDetail sessionDetail = new SessionDetail();
-				sessionDetail.setTaskid(taskid);  
-				sessionDetail.setUserid(row.getLong(1));  
-				sessionDetail.setSessionid(row.getString(2));  
-				sessionDetail.setPageid(row.getLong(3));  
-				sessionDetail.setActionTime(row.getString(4));
-				sessionDetail.setSearchKeyword(row.getString(5));  
-				sessionDetail.setClickCategoryId(row.getLong(6));  
-				sessionDetail.setClickProductId(row.getLong(7));   
-				sessionDetail.setOrderCategoryIds(row.getString(8));  
-				sessionDetail.setOrderProductIds(row.getString(9));  
-				sessionDetail.setPayCategoryIds(row.getString(10)); 
-				sessionDetail.setPayProductIds(row.getString(11)); 
-				
-				ISessionDetailDAO sessionDetailDAO = DAOFactory.getSessionDetailDAO();
-				sessionDetailDAO.insert(sessionDetail);  
-			}
-		});
+					private static final long serialVersionUID = 1L;
+
+					@Override
+					public void call(
+							Iterator<Tuple2<String, Tuple2<String, Row>>> iterator) 
+							throws Exception {
+						List<SessionDetail> sessionDetails = new ArrayList<SessionDetail>();
+						
+						while(iterator.hasNext()) {
+							Tuple2<String, Tuple2<String, Row>> tuple = iterator.next();
+							
+							Row row = tuple._2._2;
+							
+							SessionDetail sessionDetail = new SessionDetail();
+							sessionDetail.setTaskid(taskid);  
+							sessionDetail.setUserid(row.getLong(1));  
+							sessionDetail.setSessionid(row.getString(2));  
+							sessionDetail.setPageid(row.getLong(3));  
+							sessionDetail.setActionTime(row.getString(4));
+							sessionDetail.setSearchKeyword(row.getString(5));  
+							sessionDetail.setClickCategoryId(row.getLong(6));  
+							sessionDetail.setClickProductId(row.getLong(7));   
+							sessionDetail.setOrderCategoryIds(row.getString(8));  
+							sessionDetail.setOrderProductIds(row.getString(9));  
+							sessionDetail.setPayCategoryIds(row.getString(10)); 
+							sessionDetail.setPayProductIds(row.getString(11));  
+							
+							sessionDetails.add(sessionDetail);
+						}
+						
+						ISessionDetailDAO sessionDetailDAO = DAOFactory.getSessionDetailDAO();
+						sessionDetailDAO.insertBatch(sessionDetails);
+					}
+					
+				});
 	}
 	
 	/**
@@ -1012,7 +1503,7 @@ public class UserVisitSessionAnalyzeSpark {
 	 * @param sessionid2actionRDD
 	 */
 	private static List<Tuple2<CategorySortKey, String>> getTop10Category(  
-			long taskid,
+			long taskid,  
 			JavaPairRDD<String, Row> sessionid2detailRDD) {
 		/**
 		 * 第一步：获取符合条件的session访问过的所有品类
@@ -1023,32 +1514,32 @@ public class UserVisitSessionAnalyzeSpark {
 		JavaPairRDD<Long, Long> categoryidRDD = sessionid2detailRDD.flatMapToPair(
 				
 				new PairFlatMapFunction<Tuple2<String,Row>, Long, Long>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
 					public Iterable<Tuple2<Long, Long>> call(
-							Tuple2<String, Row> tuple)throws Exception {
+							Tuple2<String, Row> tuple) throws Exception {
 						Row row = tuple._2;
 						
-						List<Tuple2<Long, Long>> list = new ArrayList<Tuple2<Long,Long>>();
+						List<Tuple2<Long, Long>> list = new ArrayList<Tuple2<Long, Long>>();
 						
 						Long clickCategoryId = row.getLong(6);
-						if(clickCategoryId != null){
-							list.add(new Tuple2<Long, Long>(clickCategoryId, clickCategoryId));
+						if(clickCategoryId != null) {
+							list.add(new Tuple2<Long, Long>(clickCategoryId, clickCategoryId));   
 						}
 						
 						String orderCategoryIds = row.getString(8);
-						if(orderCategoryIds != null){
-							String[] orderCategoryIdsSplited = orderCategoryIds.split(",");
-							for(String orderCategoryId: orderCategoryIdsSplited){
+						if(orderCategoryIds != null) {
+							String[] orderCategoryIdsSplited = orderCategoryIds.split(",");  
+							for(String orderCategoryId : orderCategoryIdsSplited) {
 								list.add(new Tuple2<Long, Long>(Long.valueOf(orderCategoryId),
 										Long.valueOf(orderCategoryId)));
 							}
 						}
 						
 						String payCategoryIds = row.getString(10);
-						if(payCategoryIds != null){
+						if(payCategoryIds != null) {
 							String[] payCategoryIdsSplited = payCategoryIds.split(",");  
 							for(String payCategoryId : payCategoryIdsSplited) {
 								list.add(new Tuple2<Long, Long>(Long.valueOf(payCategoryId),
@@ -1113,7 +1604,7 @@ public class UserVisitSessionAnalyzeSpark {
 		JavaPairRDD<CategorySortKey, String> sortKey2countRDD = categoryid2countRDD.mapToPair(
 				
 				new PairFunction<Tuple2<Long,String>, CategorySortKey, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
@@ -1121,7 +1612,7 @@ public class UserVisitSessionAnalyzeSpark {
 							Tuple2<Long, String> tuple) throws Exception {
 						String countInfo = tuple._2;
 						long clickCount = Long.valueOf(StringUtils.getFieldFromConcatString(
-								countInfo, "\\|", Constants.FIELD_CLICK_COUNT));
+								countInfo, "\\|", Constants.FIELD_CLICK_COUNT));  
 						long orderCount = Long.valueOf(StringUtils.getFieldFromConcatString(
 								countInfo, "\\|", Constants.FIELD_ORDER_COUNT));  
 						long payCount = Long.valueOf(StringUtils.getFieldFromConcatString(
@@ -1130,7 +1621,7 @@ public class UserVisitSessionAnalyzeSpark {
 						CategorySortKey sortKey = new CategorySortKey(clickCount,
 								orderCount, payCount);
 						
-						return new Tuple2<CategorySortKey, String>(sortKey, countInfo);
+						return new Tuple2<CategorySortKey, String>(sortKey, countInfo);  
 					}
 					
 				});
@@ -1177,10 +1668,22 @@ public class UserVisitSessionAnalyzeSpark {
 	 */
 	private static JavaPairRDD<Long, Long> getClickCategoryId2CountRDD(
 			JavaPairRDD<String, Row> sessionid2detailRDD) {
+		/**
+		 * 说明一下：
+		 * 
+		 * 这儿，是对完整的数据进行了filter过滤，过滤出来点击行为的数据
+		 * 点击行为的数据其实只占总数据的一小部分
+		 * 所以过滤以后的RDD，每个partition的数据量，很有可能跟我们之前说的一样，会很不均匀
+		 * 而且数据量肯定会变少很多
+		 * 
+		 * 所以针对这种情况，还是比较合适用一下coalesce算子的，在filter过后去减少partition的数量
+		 * 
+		 */
+		
 		JavaPairRDD<String, Row> clickActionRDD = sessionid2detailRDD.filter(
 				
 				new Function<Tuple2<String,Row>, Boolean>() {
-
+					
 					private static final long serialVersionUID = 1L;
 		
 					@Override
@@ -1190,6 +1693,20 @@ public class UserVisitSessionAnalyzeSpark {
 					}
 					
 				});
+//				.coalesce(100);  
+		
+		/**
+		 * 对这个coalesce操作做一个说明
+		 * 
+		 * 我们在这里用的模式都是local模式，主要是用来测试，所以local模式下，不用去设置分区和并行度的数量
+		 * local模式自己本身就是进程内模拟的集群来执行，本身性能就很高
+		 * 而且对并行度、partition数量都有一定的内部的优化
+		 * 
+		 * 这里我们再自己去设置，就有点画蛇添足
+		 * 
+		 * 但是就是跟大家说明一下，coalesce算子的使用，即可
+		 * 
+		 */
 		
 		JavaPairRDD<Long, Long> clickCategoryIdRDD = clickActionRDD.mapToPair(
 				
@@ -1206,6 +1723,13 @@ public class UserVisitSessionAnalyzeSpark {
 					
 				});
 		
+		/**
+		 * 计算各个品类的点击次数
+		 * 
+		 * 如果某个品类点击了1000万次，其他品类都是10万次，那么也会数据倾斜
+		 * 
+		 */
+
 		JavaPairRDD<Long, Long> clickCategoryId2CountRDD = clickCategoryIdRDD.reduceByKey(
 				
 				new Function2<Long, Long, Long>() {
@@ -1218,6 +1742,97 @@ public class UserVisitSessionAnalyzeSpark {
 					}
 					
 				});
+		
+		/**
+		 * 提升shuffle reduce端并行度
+		 */
+		
+//		JavaPairRDD<Long, Long> clickCategoryId2CountRDD = clickCategoryIdRDD.reduceByKey(
+//				
+//				new Function2<Long, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Long call(Long v1, Long v2) throws Exception {
+//						return v1 + v2;
+//					}
+//					
+//				},
+//				1000);
+		
+		/**
+		 * 使用随机key实现双重聚合
+		 */
+		
+//		/**
+//		 * 第一步，给每个key打上一个随机数
+//		 */
+//		JavaPairRDD<String, Long> mappedClickCategoryIdRDD = clickCategoryIdRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<Long,Long>, String, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//		
+//					@Override
+//					public Tuple2<String, Long> call(Tuple2<Long, Long> tuple)
+//							throws Exception {
+//						Random random = new Random();
+//						int prefix = random.nextInt(10);
+//						return new Tuple2<String, Long>(prefix + "_" + tuple._1, tuple._2);
+//					}
+//					
+//				});
+//		
+//		/**
+//		 * 第二步，执行第一轮局部聚合
+//		 */
+//		JavaPairRDD<String, Long> firstAggrRDD = mappedClickCategoryIdRDD.reduceByKey(
+//				
+//				new Function2<Long, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Long call(Long v1, Long v2) throws Exception {
+//						return v1 + v2;
+//					}
+//					
+//				});
+//		
+//		/**
+//		 * 第三步，去除掉每个key的前缀
+//		 */
+//		JavaPairRDD<Long, Long> restoredRDD = firstAggrRDD.mapToPair(
+//				
+//				new PairFunction<Tuple2<String,Long>, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//		
+//					@Override
+//					public Tuple2<Long, Long> call(Tuple2<String, Long> tuple)
+//							throws Exception {
+//						long categoryId = Long.valueOf(tuple._1.split("_")[1]);  
+//						return new Tuple2<Long, Long>(categoryId, tuple._2);  
+//					}
+//					
+//				});
+//		
+//		/**
+//		 * 第四步，最第二轮全局的聚合
+//		 */
+//		JavaPairRDD<Long, Long> clickCategoryId2CountRDD = restoredRDD.reduceByKey(
+//				
+//				new Function2<Long, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Long call(Long v1, Long v2) throws Exception {
+//						return v1 + v2;
+//					}
+//					
+//				});
 		
 		return clickCategoryId2CountRDD;
 	}
@@ -1365,9 +1980,9 @@ public class UserVisitSessionAnalyzeSpark {
 		JavaPairRDD<Long, String> tmpMapRDD = tmpJoinRDD.mapToPair(
 				
 				new PairFunction<Tuple2<Long,Tuple2<Long,Optional<Long>>>, Long, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
-		
+
 					@Override
 					public Tuple2<Long, String> call(
 							Tuple2<Long, Tuple2<Long, Optional<Long>>> tuple)
@@ -1376,14 +1991,14 @@ public class UserVisitSessionAnalyzeSpark {
 						Optional<Long> optional = tuple._2._2;
 						long clickCount = 0L;
 						
-						if(optional.isPresent()){
+						if(optional.isPresent()) {
 							clickCount = optional.get();
 						}
 						
 						String value = Constants.FIELD_CATEGORY_ID + "=" + categoryid + "|" + 
 								Constants.FIELD_CLICK_COUNT + "=" + clickCount;
 						
-						return new Tuple2<Long, String>(categoryid, value);
+						return new Tuple2<Long, String>(categoryid, value);  
 					}
 					
 				});
@@ -1391,7 +2006,7 @@ public class UserVisitSessionAnalyzeSpark {
 		tmpMapRDD = tmpMapRDD.leftOuterJoin(orderCategoryId2CountRDD).mapToPair(
 				
 				new PairFunction<Tuple2<Long,Tuple2<String,Optional<Long>>>, Long, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
@@ -1404,21 +2019,21 @@ public class UserVisitSessionAnalyzeSpark {
 						Optional<Long> optional = tuple._2._2;
 						long orderCount = 0L;
 						
-						if(optional.isPresent()){
+						if(optional.isPresent()) {
 							orderCount = optional.get();
 						}
-
+						
 						value = value + "|" + Constants.FIELD_ORDER_COUNT + "=" + orderCount;  
-
-						return new Tuple2<Long, String>(categoryid, value);
+						
+						return new Tuple2<Long, String>(categoryid, value);  
 					}
-					
+				
 				});
 		
 		tmpMapRDD = tmpMapRDD.leftOuterJoin(payCategoryId2CountRDD).mapToPair(
 				
 				new PairFunction<Tuple2<Long,Tuple2<String,Optional<Long>>>, Long, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
@@ -1431,17 +2046,17 @@ public class UserVisitSessionAnalyzeSpark {
 						Optional<Long> optional = tuple._2._2;
 						long payCount = 0L;
 						
-						if(optional.isPresent()){
+						if(optional.isPresent()) {
 							payCount = optional.get();
 						}
 						
 						value = value + "|" + Constants.FIELD_PAY_COUNT + "=" + payCount;  
-
-						return new Tuple2<Long, String>(categoryid, value);
+						
+						return new Tuple2<Long, String>(categoryid, value);  
 					}
-					
+				
 				});
-	
+		
 		return tmpMapRDD;
 	}
 	
@@ -1459,12 +2074,12 @@ public class UserVisitSessionAnalyzeSpark {
 		 * 第一步：将top10热门品类的id，生成一份RDD
 		 */
 		List<Tuple2<Long, Long>> top10CategoryIdList = 
-				new ArrayList<Tuple2<Long,Long>>();
+				new ArrayList<Tuple2<Long, Long>>();
 		
-		for(Tuple2<CategorySortKey, String> category : top10CategoryList){
+		for(Tuple2<CategorySortKey, String> category : top10CategoryList) {
 			long categoryid = Long.valueOf(StringUtils.getFieldFromConcatString(
 					category._2, "\\|", Constants.FIELD_CATEGORY_ID));
-			top10CategoryIdList.add(new Tuple2<Long, Long>(categoryid, categoryid));
+			top10CategoryIdList.add(new Tuple2<Long, Long>(categoryid, categoryid));  
 		}
 		
 		JavaPairRDD<Long, Long> top10CategoryIdRDD = 
@@ -1473,61 +2088,61 @@ public class UserVisitSessionAnalyzeSpark {
 		/**
 		 * 第二步：计算top10品类被各session点击的次数
 		 */
-		JavaPairRDD<String, Iterable<Row>> sessionid2detailsRDD = 
+		JavaPairRDD<String, Iterable<Row>> sessionid2detailsRDD =
 				sessionid2detailRDD.groupByKey();
 		
 		JavaPairRDD<Long, String> categoryid2sessionCountRDD = sessionid2detailsRDD.flatMapToPair(
 				
 				new PairFlatMapFunction<Tuple2<String,Iterable<Row>>, Long, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
-		
+
 					@Override
 					public Iterable<Tuple2<Long, String>> call(
-							Tuple2<String, Iterable<Row>> tuple)throws Exception {
+							Tuple2<String, Iterable<Row>> tuple) throws Exception {
 						String sessionid = tuple._1;
 						Iterator<Row> iterator = tuple._2.iterator();
 						
 						Map<Long, Long> categoryCountMap = new HashMap<Long, Long>();
 						
 						// 计算出该session，对每个品类的点击次数
-						while(iterator.hasNext()){
+						while(iterator.hasNext()) {
 							Row row = iterator.next();
 							
-							if(row.get(6) != null){
+							if(row.get(6) != null) {
 								long categoryid = row.getLong(6);
 								
 								Long count = categoryCountMap.get(categoryid);
-								if(count == null){
+								if(count == null) {
 									count = 0L;
 								}
 								
-								count ++;
+								count++;
 								
 								categoryCountMap.put(categoryid, count);
 							}
 						}
- 						
-						// 返回结果，<categoryid,sessionid,count>格式
-						List<Tuple2<Long, String>> list = new ArrayList<Tuple2<Long,String>>();
 						
-						for(Map.Entry<Long, Long> categoryCountEntry: categoryCountMap.entrySet()){
+						// 返回结果，<categoryid,sessionid,count>格式
+						List<Tuple2<Long, String>> list = new ArrayList<Tuple2<Long, String>>();
+						
+						for(Map.Entry<Long, Long> categoryCountEntry : categoryCountMap.entrySet()) {
 							long categoryid = categoryCountEntry.getKey();
 							long count = categoryCountEntry.getValue();
 							String value = sessionid + "," + count;
-							list.add(new Tuple2<Long, String>(categoryid, value));
+							list.add(new Tuple2<Long, String>(categoryid, value));  
 						}
 						
 						return list;
 					}
 					
-				});
+				}) ;
 		
 		// 获取到to10热门品类，被各个session点击的次数
 		JavaPairRDD<Long, String> top10CategorySessionCountRDD = top10CategoryIdRDD
 				.join(categoryid2sessionCountRDD)
 				.mapToPair(new PairFunction<Tuple2<Long,Tuple2<Long,String>>, Long, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
@@ -1548,7 +2163,7 @@ public class UserVisitSessionAnalyzeSpark {
 		JavaPairRDD<String, String> top10SessionRDD = top10CategorySessionCountsRDD.flatMapToPair(
 				
 				new PairFlatMapFunction<Tuple2<Long,Iterable<String>>, String, String>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
@@ -1559,11 +2174,11 @@ public class UserVisitSessionAnalyzeSpark {
 						Iterator<String> iterator = tuple._2.iterator();
 						
 						// 定义取topn的排序数组
-						String[] top10Sessions = new String[10];
+						String[] top10Sessions = new String[10];   
 						
-						while (iterator.hasNext()) {
+						while(iterator.hasNext()) {
 							String sessionCount = iterator.next();
-							long count = Long.valueOf(sessionCount.split(",")[1]);
+							long count = Long.valueOf(sessionCount.split(",")[1]);  
 							
 							// 遍历排序数组
 							for(int i = 0; i < top10Sessions.length; i++) {
@@ -1594,21 +2209,23 @@ public class UserVisitSessionAnalyzeSpark {
 						List<Tuple2<String, String>> list = new ArrayList<Tuple2<String, String>>();
 						
 						for(String sessionCount : top10Sessions) {
-							String sessionid = sessionCount.split(",")[0];
-							long count = Long.valueOf(sessionCount.split(",")[1]);  
-							
-							// 将top10 session插入MySQL表
-							Top10Session top10Session = new Top10Session();
-							top10Session.setTaskid(taskid);  
-							top10Session.setCategoryid(categoryid);  
-							top10Session.setSessionid(sessionid);  
-							top10Session.setClickCount(count);  
-							
-							ITop10SessionDAO top10SessionDAO = DAOFactory.getTop10SessionDAO();
-							top10SessionDAO.insert(top10Session);  
-							
-							// 放入list
-							list.add(new Tuple2<String, String>(sessionid, sessionid));
+							if(sessionCount != null) {
+								String sessionid = sessionCount.split(",")[0];
+								long count = Long.valueOf(sessionCount.split(",")[1]);  
+								
+								// 将top10 session插入MySQL表
+								Top10Session top10Session = new Top10Session();
+								top10Session.setTaskid(taskid);  
+								top10Session.setCategoryid(categoryid);  
+								top10Session.setSessionid(sessionid);  
+								top10Session.setClickCount(count);  
+								
+								ITop10SessionDAO top10SessionDAO = DAOFactory.getTop10SessionDAO();
+								top10SessionDAO.insert(top10Session);  
+								
+								// 放入list
+								list.add(new Tuple2<String, String>(sessionid, sessionid));
+							}
 						}
 						
 						return list;

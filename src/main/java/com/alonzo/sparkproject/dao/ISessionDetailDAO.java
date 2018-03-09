@@ -1,7 +1,8 @@
 package com.alonzo.sparkproject.dao;
 
-import com.alonzo.sparkproject.domain.SessionDetail;
+import java.util.List;
 
+import com.alonzo.sparkproject.domain.SessionDetail;
 
 /**
  * Session明细DAO接口
@@ -15,5 +16,11 @@ public interface ISessionDetailDAO {
 	 * @param sessionDetail 
 	 */
 	void insert(SessionDetail sessionDetail);
+	
+	/**
+	 * 批量插入session明细数据
+	 * @param sessionDetails
+	 */
+	void insertBatch(List<SessionDetail> sessionDetails);
 	
 }

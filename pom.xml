@@ -81,6 +81,11 @@
 	  <artifactId>fastjson</artifactId>
 	  <version>1.1.41</version>
 	</dependency>
+	<dependency>  
+	  <groupId>fastutil</groupId>
+	  <artifactId>fastutil</artifactId>
+	  <version>5.0.9</version>
+	</dependency>
   </dependencies>
   
   <build>
