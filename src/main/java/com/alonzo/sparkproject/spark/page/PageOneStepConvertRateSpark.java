@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -23,10 +24,13 @@ import scala.Tuple2;
 
 import com.alibaba.fastjson.JSONObject;
 import com.alonzo.sparkproject.constant.Constants;
+import com.alonzo.sparkproject.dao.IPageSplitConvertRateDAO;
 import com.alonzo.sparkproject.dao.ITaskDAO;
 import com.alonzo.sparkproject.dao.factory.DAOFactory;
+import com.alonzo.sparkproject.domain.PageSplitConvertRate;
 import com.alonzo.sparkproject.domain.Task;
 import com.alonzo.sparkproject.util.DateUtils;
+import com.alonzo.sparkproject.util.NumberUtils;
 import com.alonzo.sparkproject.util.ParamUtils;
 import com.alonzo.sparkproject.util.SparkUtils;
 
@@ -50,7 +54,7 @@ public class PageOneStepConvertRateSpark {
 		SparkUtils.mockData(sc, sqlContext);
 		
 		// 3、查询任务，获取任务的参数
-		Long taskid = ParamUtils.getTaskIdFromArgs(args, Constants.SPARK_LOCAL_TASKID_PAGE);
+		long taskid = ParamUtils.getTaskIdFromArgs(args, Constants.SPARK_LOCAL_TASKID_PAGE);
 		
 		ITaskDAO taskDAO = DAOFactory.getTaskDAO();
 		Task task = taskDAO.findById(taskid);
@@ -90,6 +94,13 @@ public class PageOneStepConvertRateSpark {
 		// 使用者指定的页面流是3,2,5,8,6
 		// 咱们现在拿到的这个pageSplitPvMap，3->2，2->5，5->8，8->6
 		long startPagePv = getStartPagePv(taskParam, sessionid2actionsRDD);
+		
+		// 计算目标页面流的各个页面切片的转化率
+		Map<String, Double> convertRateMap = computePageSplitConvertRate(
+				taskParam, pageSplitPvMap, startPagePv);
+		
+		// 持久化页面切片转化率
+		persistConvertRate(taskid, convertRateMap); 
 	}
 	
 	/**
@@ -129,12 +140,12 @@ public class PageOneStepConvertRateSpark {
 		return sessionid2actionsRDD.flatMapToPair(
 				
 				new PairFlatMapFunction<Tuple2<String,Iterable<Row>>, String, Integer>() {
- 
+
 					private static final long serialVersionUID = 1L;
 
 					@Override
 					public Iterable<Tuple2<String, Integer>> call(
-							Tuple2<String, Iterable<Row>> tuple) 
+							Tuple2<String, Iterable<Row>> tuple)
 							throws Exception {
 						// 定义返回list
 						List<Tuple2<String, Integer>> list = 
@@ -144,7 +155,7 @@ public class PageOneStepConvertRateSpark {
 						// 获取使用者指定的页面流
 						// 使用者指定的页面流，1,2,3,4,5,6,7
 						// 1->2的转化率是多少？2->3的转化率是多少？
-						String[] targetPages = targetPageFlowBroadcast.value().split(",");
+						String[] targetPages = targetPageFlowBroadcast.value().split(",");  
 						
 						// 这里，我们拿到的session的访问行为，默认情况下是乱序的
 						// 比如说，正常情况下，我们希望拿到的数据，是按照时间顺序排序的
@@ -157,12 +168,12 @@ public class PageOneStepConvertRateSpark {
 						// 排序
 						
 						List<Row> rows = new ArrayList<Row>();
-						while(iterator.hasNext()){
-							rows.add(iterator.next());
+						while(iterator.hasNext()) {
+							rows.add(iterator.next());  
 						}
 						
 						Collections.sort(rows, new Comparator<Row>() {
-
+							
 							@Override
 							public int compare(Row o1, Row o2) {
 								String actionTime1 = o1.getString(4);
@@ -179,10 +190,10 @@ public class PageOneStepConvertRateSpark {
 						// 页面切片的生成，以及页面流的匹配
 						Long lastPageId = null;
 						
-						for(Row row : rows){
+						for(Row row : rows) {
 							long pageid = row.getLong(3);
 							
-							if(lastPageId == null){
+							if(lastPageId == null) {
 								lastPageId = pageid;
 								continue;
 							}
@@ -195,14 +206,14 @@ public class PageOneStepConvertRateSpark {
 							String pageSplit = lastPageId + "_" + pageid;
 							
 							// 对这个切片判断一下，是否在用户指定的页面流中
-							for(int i = 1; i < targetPages.length; i++){
+							for(int i = 1; i < targetPages.length; i++) {
 								// 比如说，用户指定的页面流是3,2,5,8,1
 								// 遍历的时候，从索引1开始，就是从第二个页面开始
 								// 3_2
 								String targetPageSplit = targetPages[i - 1] + "_" + targetPages[i];
 								
-								if(pageSplit.equals(targetPageSplit)){
-									list.add(new Tuple2<String, Integer>(pageSplit, 1));
+								if(pageSplit.equals(targetPageSplit)) {
+									list.add(new Tuple2<String, Integer>(pageSplit, 1));  
 									break;
 								}
 							}
@@ -257,6 +268,77 @@ public class PageOneStepConvertRateSpark {
 				});
 		
 		return startPageRDD.count();
+	}
+
+	/**
+	 * 计算页面切片转化率
+	 * @param pageSplitPvMap 页面切片pv
+	 * @param startPagePv 起始页面pv
+	 * @return
+	 */
+	private static Map<String, Double> computePageSplitConvertRate(
+			JSONObject taskParam,
+			Map<String, Object> pageSplitPvMap,
+			long startPagePv) {
+		Map<String, Double> convertRateMap = new HashMap<String, Double>();
+		
+		String[] targetPages = ParamUtils.getParam(taskParam, 
+				Constants.PARAM_TARGET_PAGE_FLOW).split(","); 
+		
+		long lastPageSplitPv = 0L;
+		
+		// 3,5,2,4,6
+		// 3_5
+		// 3_5 pv / 3 pv
+		// 5_2 rate = 5_2 pv / 3_5 pv
+		
+		// 通过for循环，获取目标页面流中的各个页面切片（pv）
+		for(int i = 1; i < targetPages.length; i++) {
+			String targetPageSplit = targetPages[i - 1] + "_" + targetPages[i];
+			long targetPageSplitPv = Long.valueOf(String.valueOf(
+					pageSplitPvMap.get(targetPageSplit)));  
+			
+			double convertRate = 0.0;
+			
+			if(i == 1) {
+				convertRate = NumberUtils.formatDouble(
+						(double)targetPageSplitPv / (double)startPagePv, 2);  
+			} else {
+				convertRate = NumberUtils.formatDouble(
+						(double)targetPageSplitPv / (double)lastPageSplitPv, 2);
+			}
+			
+			convertRateMap.put(targetPageSplit, convertRate);
+			
+			lastPageSplitPv = targetPageSplitPv;
+		}
+		
+		return convertRateMap;
+	}
+	
+	/**
+	 * 持久化转化率
+	 * @param convertRateMap
+	 */
+	private static void persistConvertRate(long taskid,
+			Map<String, Double> convertRateMap) {
+		StringBuffer buffer = new StringBuffer("");
+		
+		for(Map.Entry<String, Double> convertRateEntry : convertRateMap.entrySet()) {
+			String pageSplit = convertRateEntry.getKey();
+			double convertRate = convertRateEntry.getValue();
+			buffer.append(pageSplit + "=" + convertRate + "|");
+		}
+		
+		String convertRate = buffer.toString();
+		convertRate = convertRate.substring(0, convertRate.length() - 1);
+		
+		PageSplitConvertRate pageSplitConvertRate = new PageSplitConvertRate();
+		pageSplitConvertRate.setTaskid(taskid); 
+		pageSplitConvertRate.setConvertRate(convertRate); 
+		
+		IPageSplitConvertRateDAO pageSplitConvertRateDAO = DAOFactory.getPageSplitConvertRateDAO();
+		pageSplitConvertRateDAO.insert(pageSplitConvertRate); 
 	}
 	
 }

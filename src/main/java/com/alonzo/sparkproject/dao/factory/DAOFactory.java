@@ -1,11 +1,13 @@
 package com.alonzo.sparkproject.dao.factory;
 
+import com.alonzo.sparkproject.dao.IPageSplitConvertRateDAO;
 import com.alonzo.sparkproject.dao.ISessionAggrStatDAO;
 import com.alonzo.sparkproject.dao.ISessionDetailDAO;
 import com.alonzo.sparkproject.dao.ISessionRandomExtractDAO;
 import com.alonzo.sparkproject.dao.ITaskDAO;
 import com.alonzo.sparkproject.dao.ITop10CategoryDAO;
 import com.alonzo.sparkproject.dao.ITop10SessionDAO;
+import com.alonzo.sparkproject.dao.impl.PageSplitConvertRateDAOImpl;
 import com.alonzo.sparkproject.dao.impl.SessionAggrStatDAOImpl;
 import com.alonzo.sparkproject.dao.impl.SessionDetailDAOImpl;
 import com.alonzo.sparkproject.dao.impl.SessionRandomExtractDAOImpl;
@@ -42,5 +44,9 @@ public class DAOFactory {
 	
 	public static ITop10SessionDAO getTop10SessionDAO() {
 		return new Top10SessionDAOImpl();
+	}
+	
+	public static IPageSplitConvertRateDAO getPageSplitConvertRateDAO() {
+		return new PageSplitConvertRateDAOImpl();
 	}
 }
