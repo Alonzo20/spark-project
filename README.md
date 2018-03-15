@@ -53,7 +53,6 @@
  * 3、根据指定页面流中各个页面切片的访问量，计算出来各个页面切片的转化率<br>
  * 4、计算出来的转化率，写入mysql数据库中<br>
 
-
 # 需求分析
 * 用户指定的页面流id：3,5,7,9,10,21<br>
 * 页面3->页面5的转换率是多少；<br>
@@ -70,3 +69,26 @@
 * 4、计算出符合页面流的各个切片的pv（访问量）<br>
 * 5、针对用户指定的页面流，去计算各个页面单跳切片的转化率<br>
 * 6、将计算结果持久化到数据库中（备注：数据表，其实是比较简单的, taskid：唯一标识一个任务,convert_rate：页面流中，各个页面切片的转化率，以特定的格式拼接起来，作为这个字段的值 3,5=10%;5,7=20%）<br>
+
+
+ # 需求3
+ ## 根据用户指定的日期范围，统计各个区域下的最热门的top3商品
+* 1、区域信息在哪里，各个城市的信息，城市是不怎么变化的，没有必要存储在hive里？MySQL，Hive和MySQL异构数据源使用，技术点<br>
+* 2、hive用户行为数据，和mysql城市信息，join，关联之后是RDD？RDD转换DataFrame，注册临时表，技术点<br>
+* 3、各个区域下各个商品的点击量，保留每个区域的城市列表数据？自定义UDAF函数，group_concat_distinct()<br>
+* 4、product_id，join hive表中的商品信息，商品信息在哪里？Hive。商品的经营类型是什么？自定义UDF函数，get_json_object()，if()<br>
+* 5、获取每个区域的点击量top3商品？开窗函数；给每个区域打上级别的标识，西北大区，经济落后，区域上的划分，C类区域；北京、上海，发达，标记A类<br>
+* 6、Spark SQL的数据倾斜解决方案？双重group by、随机key以及扩容表（自定义UDF函数，random_key()）、内置reduce join转换为map join、shuffle并行度<br>
+
+## 技术方案设计：
+* 1、查询task，获取日期范围，通过Spark SQL，查询user_visit_action表中的指定日期范围内的数据，过滤出，商品点击行为，click_product_id is not null；click_product_id != 'NULL'；click_product_id != 'null'；city_id，click_product_id<br>
+* 2、使用Spark SQL从MySQL中查询出来城市信息（city_id、city_name、area），用户访问行为数据要跟城市信息进行join，city_id、city_name、area、product_id，RDD，转换成DataFrame，注册成一个临时表<br>
+* 3、Spark SQL内置函数（case when），对area打标记（华东大区，A级，华中大区，B级，东北大区，C级，西北大区，D级），area_level<br>
+* 4、计算出来每个区域下每个商品的点击次数，group by area, product_id；保留每个区域的城市名称列表；自定义UDAF，group_concat_distinct()函数，聚合出来一个city_names字段，area、product_id、city_names、click_count<br>
+* 5、join商品明细表，hive（product_id、product_name、extend_info），extend_info是json类型，自定义UDF，get_json_object()函数，取出其中的product_status字段，if()函数（Spark SQL内置函数），判断，0 自营，1 第三方；（area、product_id、city_names、click_count、product_name、product_status）<br>
+* 6、开窗函数，根据area来聚合，获取每个area下，click_count排名前3的product信息；area、area_level、product_id、city_names、click_count、product_name、product_status
+* 7、结果写入MySQL表中
+* 8、Spark SQL的数据倾斜解决方案？双重group by、随机key以及扩容表（自定义UDF函数，random_key()）、Spark SQL内置的reduce join转换为map join、提高shuffle并行度<br>
+* 9、本地测试和生产环境的测试<br>
+
+
