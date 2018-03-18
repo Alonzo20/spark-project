@@ -10,10 +10,84 @@ Target Server Type    : MYSQL
 Target Server Version : 50173
 File Encoding         : 65001
 
-Date: 2018-03-17 15:26:21
+Date: 2018-03-18 19:41:42
 */
 
 SET FOREIGN_KEY_CHECKS=0;
+
+-- ----------------------------
+-- Table structure for ad_blacklist
+-- ----------------------------
+DROP TABLE IF EXISTS `ad_blacklist`;
+CREATE TABLE `ad_blacklist` (
+  `user_id` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- ----------------------------
+-- Records of ad_blacklist
+-- ----------------------------
+
+-- ----------------------------
+-- Table structure for ad_click_trend
+-- ----------------------------
+DROP TABLE IF EXISTS `ad_click_trend`;
+CREATE TABLE `ad_click_trend` (
+  `date` varchar(30) DEFAULT NULL,
+  `hour` varchar(30) DEFAULT NULL,
+  `minute` varchar(30) DEFAULT NULL,
+  `ad_id` int(11) DEFAULT NULL,
+  `click_count` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- ----------------------------
+-- Records of ad_click_trend
+-- ----------------------------
+
+-- ----------------------------
+-- Table structure for ad_province_top3
+-- ----------------------------
+DROP TABLE IF EXISTS `ad_province_top3`;
+CREATE TABLE `ad_province_top3` (
+  `date` varchar(30) DEFAULT NULL,
+  `province` varchar(100) DEFAULT NULL,
+  `ad_id` int(11) DEFAULT NULL,
+  `click_count` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- ----------------------------
+-- Records of ad_province_top3
+-- ----------------------------
+
+-- ----------------------------
+-- Table structure for ad_stat
+-- ----------------------------
+DROP TABLE IF EXISTS `ad_stat`;
+CREATE TABLE `ad_stat` (
+  `date` varchar(30) DEFAULT NULL,
+  `province` varchar(100) DEFAULT NULL,
+  `city` varchar(100) DEFAULT NULL,
+  `ad_id` int(11) DEFAULT NULL,
+  `click_count` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- ----------------------------
+-- Records of ad_stat
+-- ----------------------------
+
+-- ----------------------------
+-- Table structure for ad_user_click_count
+-- ----------------------------
+DROP TABLE IF EXISTS `ad_user_click_count`;
+CREATE TABLE `ad_user_click_count` (
+  `date` varchar(30) DEFAULT NULL,
+  `user_id` int(11) DEFAULT NULL,
+  `ad_id` int(11) DEFAULT NULL,
+  `click_count` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- ----------------------------
+-- Records of ad_user_click_count
+-- ----------------------------
 
 -- ----------------------------
 -- Table structure for area_top3_product
